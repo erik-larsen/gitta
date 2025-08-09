@@ -6,7 +6,7 @@ A tool to manage multiple repos.
 ## Quick start
 
 #### `gitta.py -u` or `gitta.py`
-Probably the most frequently used option, this looks at all your local repos and does a fetch and pull (if no active local changes) on each to get them up to date with remote.  Helpful if you are doing work on one repo across multiple machines.
+Probably the most frequently used option, this looks at all your local repos and does a fetch and pull (if no active local changes) on each to get them up to date with remote.  Helpful if you are doing work on the same repos across multiple machines.
 
 #### `gitta.py -ca erik-larsen`
 Clone all repos under a username.  For any repos you already have cloned, works the same as -u (fetch & pull).  Helpful if you have a new machine and want to get all your repos.  
