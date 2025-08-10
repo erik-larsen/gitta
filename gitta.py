@@ -60,7 +60,7 @@ def list_github_repos(username):
         if not repos:
             print(f"User '{username}' has no public repos")
             return []
-        
+
         repo_names = [repo['name'] for repo in repos]
         return repo_names
     elif response.status_code == 404:
@@ -119,6 +119,52 @@ def clone_or_pull_repos(username, repos):
             except subprocess.CalledProcessError as e:
                 print(f"Error cloning '{repo_name}': {e}")
 
+def _prompt_for_identity(repo_name, known_identities):
+    """
+    Prompts the user to select an existing identity or enter a new one.
+
+    Args:
+        repo_name (str): The name of the repository.
+        known_identities (list): A list of (username, email) tuples.
+
+    Returns:
+        tuple: A (username, email) tuple for the repository.
+    """
+    print(f"\nNo complete user identity (name and email) set for '{repo_name}'.")
+
+    if not known_identities:
+        print("No existing identities found. Please enter a new one.")
+        new_name = input("Enter user.name: ")
+        new_email = input("Enter user.email: ")
+        return new_name, new_email
+
+    print("Please choose an identity:")
+    for i, (name, email) in enumerate(known_identities):
+        default_text = " (default, press Enter)" if i == 0 else ""
+        print(f"  {i+1}: {name} <{email}>{default_text}")
+
+    print("  N: Enter a new identity")
+
+    while True:
+        choice = input("Your choice: ").strip().lower()
+
+        if not choice:  # Default to the most recent one
+            return known_identities[0]
+
+        if choice == 'n':
+            new_name = input("Enter new user.name: ")
+            new_email = input("Enter new user.email: ")
+            return new_name, new_email
+
+        try:
+            choice_idx = int(choice) - 1
+            if 0 <= choice_idx < len(known_identities):
+                return known_identities[choice_idx]
+            else:
+                print(f"Invalid number. Please enter a number between 1 and {len(known_identities)}.")
+        except ValueError:
+            print("Invalid input. Please enter a number or 'n'.")
+
 def update_repos():
     """
     Updates all local repos in the current directory with the logic from git-update.sh.
@@ -126,7 +172,8 @@ def update_repos():
     clean_repos = []
     wip_repos = []
     owner_mismatch_repos = []
-    
+    known_identities = []
+
     current_dir = os.getcwd()
 
     # Create global gitignore if it doesn't exist
@@ -138,7 +185,7 @@ def update_repos():
         print("Global .gitignore created and configured successfully")
     else:
         print("Global .gitignore file already exists. Skipping creation")
-        
+
     for dir_name in os.listdir('.'):
         repo_path = os.path.join(current_dir, dir_name)
         if os.path.isdir(repo_path) and dir_name != '.' and '.git' in os.listdir(repo_path):
@@ -151,22 +198,28 @@ def update_repos():
             local_username = run_git(['config', '--local', 'user.name'], repo_path)
             local_email = run_git(['config', '--local', 'user.email'], repo_path)
 
-            if not local_username:
-                local_username = input(f"No USER.NAME set for {dir_name}, please enter: ")
-                run_git(['config', '--local', 'user.name', local_username], repo_path)
+            if not local_username or not local_email:
+                new_username, new_email = _prompt_for_identity(dir_name, known_identities)
+                if new_username and new_email:
+                    run_git(['config', '--local', 'user.name', new_username], repo_path)
+                    run_git(['config', '--local', 'user.email', new_email], repo_path)
+                    local_username = new_username
+                    local_email = new_email
 
-            if not local_email:
-                local_email = input(f"No USER.EMAIL set for {dir_name}, please enter: ")
-                run_git(['config', '--local', 'user.email', local_email], repo_path)
-            
+            if local_username and local_email:
+                identity = (local_username, local_email)
+                if identity in known_identities:
+                    known_identities.remove(identity)
+                known_identities.insert(0, identity)
+
             print(f"Local user.name:  {local_username}")
             print(f"Local user.email: {local_email}")
-            
+
             # Step 2: Compare local user to repo owner
             print("\nStep 2: compare local user to repo owner..")
             remote_url = run_git(['config', '--get', 'remote.origin.url'], repo_path)
             repo_owner = get_repo_owner(remote_url)
-            
+
             if not remote_url:
                 print("WARNING: No 'origin' remote found. Skipping owner check")
             elif not repo_owner:
@@ -177,7 +230,7 @@ def update_repos():
                 else:
                     print(f"WARNING: Local user.name ('{local_username}') does NOT match repo owner ('{repo_owner}')")
                     owner_mismatch_repos.append(dir_name)
-            
+
             print(f"\nStep 3: fetch and pull (if clean) in {dir_name}..")
             _update_local_repo(repo_path, dir_name, clean_repos, wip_repos)
 
@@ -226,7 +279,7 @@ if __name__ == "__main__":
                 if repos:
                     for repo in repos:
                         print(f"{repo}")
-            
+
             if args.clone_all:
                 clone_or_pull_repos(args.username, repos)
 
