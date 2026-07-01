@@ -165,6 +165,54 @@ def _prompt_for_identity(repo_name, known_identities):
         except ValueError:
             print("Invalid input. Please enter a number or 'n'.")
 
+def show_status():
+    """
+    Shows a table of git status and local user.name/user.email for all repos in the current directory.
+    """
+    current_dir = os.getcwd()
+
+    def count_text(count, unit):
+        return f"{count} {unit}" if count else "-"
+
+    rows = []
+    for dir_name in sorted(os.listdir('.')):
+        repo_path = os.path.join(current_dir, dir_name)
+        if os.path.isdir(repo_path) and '.git' in os.listdir(repo_path):
+            local_username = run_git(['config', '--local', 'user.name'], repo_path)
+            local_email = run_git(['config', '--local', 'user.email'], repo_path)
+            user = f"{local_username or '(not set)'}, {local_email or '(not set)'}"
+
+            branch = run_git(['branch', '--show-current'], repo_path) or '(detached)'
+
+            # "behind ahead" counts vs upstream; empty if no upstream is set
+            counts = run_git(['rev-list', '--left-right', '--count', '@{upstream}...HEAD'], repo_path)
+            if counts:
+                behind, ahead = (int(n) for n in counts.split())
+                to_pull = count_text(behind, "commits")
+                to_push = count_text(ahead, "commits")
+            else:
+                to_pull = to_push = "no upstream"
+
+            to_commit = 0
+            to_add = 0
+            for line in run_git(['status', '--porcelain'], repo_path).splitlines():
+                if line.startswith('??'):
+                    to_add += 1
+                else:
+                    to_commit += 1
+
+            rows.append([dir_name, user, branch, to_pull, to_push,
+                         count_text(to_commit, "files"), count_text(to_add, "files")])
+
+    if not rows:
+        print("No git repos found in the current directory")
+        return
+
+    headers = ["REPO", "USER", "BRANCH", "TO PULL", "TO PUSH", "TO COMMIT", "TO ADD"]
+    widths = [max(len(headers[i]), max(len(row[i]) for row in rows)) for i in range(len(headers))]
+    for row in [headers] + rows:
+        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+
 def update_repos():
     """
     Updates all local repos in the current directory with the logic from git-update.sh.
@@ -267,6 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("-l", "--list", action="store_true", help="List all public repos for username")
     parser.add_argument("-ca", "--clone-all", action="store_true", help="Clone/update all public repos for username")
     parser.add_argument("-u", "--update", action="store_true", help="Update (fetch & pull) all local repos in the current directory")
+    parser.add_argument("-s", "--status", action="store_true", help="Show git status and user.name/user.email for all local repos in the current directory")
 
     args = parser.parse_args()
 
@@ -282,6 +331,9 @@ if __name__ == "__main__":
 
             if args.clone_all:
                 clone_or_pull_repos(args.username, repos)
+
+    elif args.status:
+        show_status()
 
     elif args.update or len(sys.argv) == 1:
         update_repos()
