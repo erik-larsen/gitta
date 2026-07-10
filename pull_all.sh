@@ -1,1 +1,1 @@
-find . -type d -depth 1 -print -exec git -C {} pull \;
+find . -maxdepth 1 -type d -print -exec git -C {} pull \;
