@@ -378,7 +378,7 @@ if __name__ == "__main__":
     parser.add_argument("-ca", "--clone-all", action="store_true", help="Clone/update all public repos for username")
     parser.add_argument("-u", "--update", nargs='?', const=True, default=False, metavar="REPO",
                         help="Update (fetch & fast-forward) all local repos in the current directory, or just REPO if given")
-    parser.add_argument("-s", "--status", action="store_true", help="Show git status and user.name/user.email for all local repos in the current directory")
+    parser.add_argument("-s", "--status", action="store_true", help="Show compact git status and user.name/user.email for all local repos in the current directory (default)")
 
     args = parser.parse_args()
 
@@ -395,10 +395,10 @@ if __name__ == "__main__":
             if args.clone_all:
                 clone_or_pull_repos(args.username, repos)
 
-    elif args.status:
+    elif args.status or len(sys.argv) == 1:
         show_status()
 
-    elif args.update or len(sys.argv) == 1:
+    elif args.update:
         update_repos(args.update if isinstance(args.update, str) else None)
 
     else:
