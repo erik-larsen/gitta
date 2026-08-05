@@ -29,7 +29,15 @@ Get up to date with the remote on all your local repos (or just one, if named). 
 Ends with a summary of which repos are clean, which have work in progress, and which are owned by someone else.
 
 #### `gitta.py -l erik-larsen`
-See what public repos are available from a username.
+See what public repos are available from a username, with license, stars, and forks.
+
+```
+REPO                           LICENSE     STARS  FORKS
+ammo.js                        Other           8      4
+api-reference                  MIT             7      3
+awesome-playcanvas             CC0-1.0       474     61
+basis_universal                Apache-2.0      2      4
+```
 
 #### `gitta.py -ca erik-larsen`
 Clone all public repos under a username.  Repos you already have are updated (fetch & fast-forward) instead.  Helpful if you have a new machine and want to get all your repos.

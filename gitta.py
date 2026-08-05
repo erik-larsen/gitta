@@ -42,15 +42,26 @@ def get_repo_owner(remote_url):
             return owner_and_repo[0]
     return None
 
+def print_table(headers, rows, right_align=()):
+    """
+    Prints rows as a column-aligned table. Column indexes listed in
+    right_align are right-justified (for numeric columns).
+    """
+    widths = [max(len(headers[i]), max(len(row[i]) for row in rows)) for i in range(len(headers))]
+    for row in [headers] + rows:
+        cells = [cell.rjust(w) if i in right_align else cell.ljust(w)
+                 for i, (cell, w) in enumerate(zip(row, widths))]
+        print("  ".join(cells).rstrip())
+
 def list_github_repos(username):
     """
-    Lists all public GitHub repos for a given username.
+    Fetches all public GitHub repos for a given username.
 
     Args:
         username (str): The GitHub username.
 
     Returns:
-        list: A list of repository names, or None if the user is not found.
+        list: A list of repo info dicts from the GitHub API, or None if the user is not found.
     """
     url = f"https://api.github.com/users/{username}/repos"
 
@@ -78,7 +89,7 @@ def list_github_repos(username):
         print(f"User '{username}' has no public repos")
         return []
 
-    return [repo['name'] for repo in repos]
+    return repos
 
 def get_repo_status(repo_path):
     """
@@ -105,6 +116,24 @@ def get_repo_status(repo_path):
 
     return {'branch': branch, 'behind': behind, 'ahead': ahead,
             'to_commit': to_commit, 'to_add': to_add}
+
+def show_repo_list(repos):
+    """
+    Prints a table of repo name, license, stars, and forks from GitHub API repo info.
+    """
+    if not repos:
+        return
+
+    rows = []
+    for repo in repos:
+        lic = repo.get('license') or {}
+        lic_text = lic.get('spdx_id') or ''
+        if not lic_text or lic_text == 'NOASSERTION':
+            lic_text = lic.get('name') or '-'
+        rows.append([repo['name'], lic_text,
+                     str(repo['stargazers_count']), str(repo['forks_count'])])
+
+    print_table(["REPO", "LICENSE", "STARS", "FORKS"], rows, right_align={2, 3})
 
 def _update_local_repo(repo_path, repo_name, clean_repos, wip_repos):
     """
@@ -270,10 +299,7 @@ def show_status():
         print("No git repos found in the current directory")
         return
 
-    headers = ["REPO", "USER", "BRANCH", "TO PULL", "TO PUSH", "TO COMMIT", "TO ADD"]
-    widths = [max(len(headers[i]), max(len(row[i]) for row in rows)) for i in range(len(headers))]
-    for row in [headers] + rows:
-        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+    print_table(["REPO", "USER", "BRANCH", "TO PULL", "TO PUSH", "TO COMMIT", "TO ADD"], rows)
 
 def update_repos(single_repo=None):
     """
@@ -398,12 +424,10 @@ if __name__ == "__main__":
         repos = list_github_repos(args.username)
         if repos is not None:
             if args.list:
-                if repos:
-                    for repo in repos:
-                        print(f"{repo}")
+                show_repo_list(repos)
 
             if args.clone_all:
-                clone_or_pull_repos(args.username, repos)
+                clone_or_pull_repos(args.username, [repo['name'] for repo in repos])
 
     elif args.status or len(sys.argv) == 1:
         show_status()
