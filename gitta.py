@@ -53,22 +53,32 @@ def list_github_repos(username):
         list: A list of repository names, or None if the user is not found.
     """
     url = f"https://api.github.com/users/{username}/repos"
-    response = requests.get(url)
 
-    if response.status_code == 200:
-        repos = response.json()
-        if not repos:
-            print(f"User '{username}' has no public repos")
-            return []
+    # Results are paginated, so keep fetching until we get a short page
+    repos = []
+    page = 1
+    per_page = 100
+    while True:
+        response = requests.get(url, params={'per_page': per_page, 'page': page})
 
-        repo_names = [repo['name'] for repo in repos]
-        return repo_names
-    elif response.status_code == 404:
-        print(f"User '{username}' not found")
-        return None
-    else:
-        print(f"Error fetching repos. Status code: {response.status_code}")
-        return None
+        if response.status_code == 200:
+            batch = response.json()
+            repos.extend(batch)
+            if len(batch) < per_page:
+                break
+            page += 1
+        elif response.status_code == 404:
+            print(f"User '{username}' not found")
+            return None
+        else:
+            print(f"Error fetching repos. Status code: {response.status_code}")
+            return None
+
+    if not repos:
+        print(f"User '{username}' has no public repos")
+        return []
+
+    return [repo['name'] for repo in repos]
 
 def get_repo_status(repo_path):
     """
