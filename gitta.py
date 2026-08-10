@@ -42,6 +42,18 @@ def get_repo_owner(remote_url):
             return owner_and_repo[0]
     return None
 
+def _github_headers():
+    """
+    Returns request headers for the GitHub API. If a GITHUB_TOKEN environment
+    variable is set, authenticated requests are used, which raises the rate
+    limit from 60 to 5000 requests/hour.
+    """
+    headers = {'Accept': 'application/vnd.github+json'}
+    token = os.environ.get('GITHUB_TOKEN')
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    return headers
+
 def list_github_repos(username):
     """
     Lists all public GitHub repos for a given username.
@@ -53,7 +65,7 @@ def list_github_repos(username):
         list: A list of repository names, or None if the user is not found.
     """
     url = f"https://api.github.com/users/{username}/repos"
-    response = requests.get(url)
+    response = requests.get(url, headers=_github_headers())
 
     if response.status_code == 200:
         repos = response.json()
@@ -68,6 +80,84 @@ def list_github_repos(username):
         return None
     else:
         print(f"Error fetching repos. Status code: {response.status_code}")
+        return None
+
+def read_owners_file():
+    """Reads a list of usernames from owners.txt in the script's directory."""
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    file_path = os.path.join(script_dir, 'owners.txt')
+
+    if not os.path.exists(file_path):
+        return []
+    try:
+        with open(file_path, 'r') as f:
+            return [line.strip() for line in f if line.strip()]
+    except IOError as e:
+        print(f"Warning: Could not read {file_path}: {e}")
+        return []
+
+def get_github_user_email(username):
+    """
+    Fetches the public email for a GitHub user. First tries the user profile,
+    then falls back to scanning the user's OWN public push events for a commit
+    email that verifiably belongs to them (a push can contain commits authored
+    by other people, so we must not blindly trust the first email we see).
+    """
+    headers = _github_headers()
+    try:
+        # First, try the main user endpoint
+        user_url = f"https://api.github.com/users/{username}"
+        user_response = requests.get(user_url, headers=headers)
+        user_response.raise_for_status()
+        user_data = user_response.json()
+        if user_data.get('email'):
+            return user_data.get('email')
+
+        # Fallback: The 'email' field is often null. Scan the user's public push
+        # events, but only accept a commit email we can tie back to this user.
+        print(f"User email for '{username}' is private, checking public events for a commit email...")
+        login = user_data.get('login') or username
+        # Names the commit author must match to be considered "this user".
+        identifiers = {s.lower() for s in (login, user_data.get('name')) if s}
+
+        events_url = f"https://api.github.com/users/{username}/events/public"
+        events_response = requests.get(events_url, headers=headers)
+        events_response.raise_for_status()
+        events_data = events_response.json()
+
+        for event in events_data:
+            if event.get('type') != 'PushEvent':
+                continue
+            # Only trust pushes made by the user themselves.
+            if (event.get('actor', {}).get('login') or '').lower() != login.lower():
+                continue
+            for commit in event.get('payload', {}).get('commits', []):
+                author = commit.get('author', {})
+                author_email = author.get('email')
+                if not author_email:
+                    continue
+                author_name = (author.get('name') or '').lower()
+                email_lower = author_email.lower()
+                # Accept only if the commit author verifiably is this user:
+                # either the author name matches, or it's a GitHub noreply
+                # address that encodes the user's login.
+                is_owner_noreply = (
+                    'users.noreply.github.com' in email_lower
+                    and login.lower() in email_lower
+                )
+                if author_name in identifiers or is_owner_noreply:
+                    print(f"Found public commit email for '{username}': {author_email}")
+                    return author_email
+        return None
+
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            print(f"User '{username}' not found.")
+        else:
+            print(f"Warning: HTTP error fetching data for '{username}': {e}")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Network error fetching user data for '{username}': {e}")
         return None
 
 def _update_local_repo(repo_path, repo_name, clean_repos, wip_repos):
@@ -222,6 +312,10 @@ def update_repos():
     owner_mismatch_repos = []
     known_identities = []
 
+    owners = read_owners_file()
+    if owners:
+        print(f"Loaded trusted owners from owners.txt: {', '.join(owners)}")
+
     current_dir = os.getcwd()
 
     # Create global gitignore if it doesn't exist
@@ -247,12 +341,31 @@ def update_repos():
             local_email = run_git(['config', '--local', 'user.email'], repo_path)
 
             if not local_username or not local_email:
-                new_username, new_email = _prompt_for_identity(dir_name, known_identities)
-                if new_username and new_email:
-                    run_git(['config', '--local', 'user.name', new_username], repo_path)
-                    run_git(['config', '--local', 'user.email', new_email], repo_path)
-                    local_username = new_username
-                    local_email = new_email
+                remote_url = run_git(['config', '--get', 'remote.origin.url'], repo_path)
+                repo_owner = get_repo_owner(remote_url)
+                new_username, new_email = (None, None)
+
+                if repo_owner and repo_owner in owners:
+                    print(f"Repo owner '{repo_owner}' found in owners.txt. Attempting to set identity.")
+                    github_email = get_github_user_email(repo_owner)
+                    if github_email:
+                        print(f"Found public email for '{repo_owner}': {github_email}")
+                        new_username = repo_owner
+                        new_email = github_email
+                        run_git(['config', '--local', 'user.name', new_username], repo_path)
+                        run_git(['config', '--local', 'user.email', new_email], repo_path)
+                        local_username = new_username
+                        local_email = new_email
+                    else:
+                        print(f"Could not find a public email for '{repo_owner}'. Please set identity manually.")
+
+                if not local_username or not local_email:
+                    new_username, new_email = _prompt_for_identity(dir_name, known_identities)
+                    if new_username and new_email:
+                        run_git(['config', '--local', 'user.name', new_username], repo_path)
+                        run_git(['config', '--local', 'user.email', new_email], repo_path)
+                        local_username = new_username
+                        local_email = new_email
 
             if local_username and local_email:
                 identity = (local_username, local_email)
