@@ -54,33 +54,99 @@ def _github_headers():
         headers['Authorization'] = f'Bearer {token}'
     return headers
 
+def print_table(headers, rows, right_align=()):
+    """
+    Prints rows as a column-aligned table. Column indexes listed in
+    right_align are right-justified (for numeric columns).
+    """
+    widths = [max(len(headers[i]), max(len(row[i]) for row in rows)) for i in range(len(headers))]
+    for row in [headers] + rows:
+        cells = [cell.rjust(w) if i in right_align else cell.ljust(w)
+                 for i, (cell, w) in enumerate(zip(row, widths))]
+        print("  ".join(cells).rstrip())
+
 def list_github_repos(username):
     """
-    Lists all public GitHub repos for a given username.
+    Fetches all public GitHub repos for a given username.
 
     Args:
         username (str): The GitHub username.
 
     Returns:
-        list: A list of repository names, or None if the user is not found.
+        list: A list of repo info dicts from the GitHub API, or None if the user is not found.
     """
     url = f"https://api.github.com/users/{username}/repos"
-    response = requests.get(url, headers=_github_headers())
 
-    if response.status_code == 200:
-        repos = response.json()
-        if not repos:
-            print(f"User '{username}' has no public repos")
-            return []
+    # Results are paginated, so keep fetching until we get a short page
+    repos = []
+    page = 1
+    per_page = 100
+    while True:
+        response = requests.get(url, params={'per_page': per_page, 'page': page},
+                                headers=_github_headers())
 
-        repo_names = [repo['name'] for repo in repos]
-        return repo_names
-    elif response.status_code == 404:
-        print(f"User '{username}' not found")
-        return None
+        if response.status_code == 200:
+            batch = response.json()
+            repos.extend(batch)
+            if len(batch) < per_page:
+                break
+            page += 1
+        elif response.status_code == 404:
+            print(f"User '{username}' not found")
+            return None
+        else:
+            print(f"Error fetching repos. Status code: {response.status_code}")
+            return None
+
+    if not repos:
+        print(f"User '{username}' has no public repos")
+        return []
+
+    return repos
+
+def get_repo_status(repo_path):
+    """
+    Returns a dict with the repo's branch, upstream behind/ahead counts, and
+    pending file counts. behind/ahead are None if no upstream is set.
+    Counts are relative to the locally-known remote-tracking ref; a fetch is
+    required first for them to reflect the actual remote.
+    """
+    branch = run_git(['branch', '--show-current'], repo_path) or '(detached)'
+
+    counts = run_git(['rev-list', '--left-right', '--count', '@{upstream}...HEAD'], repo_path)
+    if counts:
+        behind, ahead = (int(n) for n in counts.split())
     else:
-        print(f"Error fetching repos. Status code: {response.status_code}")
-        return None
+        behind = ahead = None
+
+    to_commit = 0
+    to_add = 0
+    for line in run_git(['status', '--porcelain'], repo_path).splitlines():
+        if line.startswith('??'):
+            to_add += 1
+        else:
+            to_commit += 1
+
+    return {'branch': branch, 'behind': behind, 'ahead': ahead,
+            'to_commit': to_commit, 'to_add': to_add}
+
+def show_repo_list(repos):
+    """
+    Prints a table of repo name, license, stars, and forks from GitHub API repo info.
+    """
+    if not repos:
+        return
+
+    rows = []
+    for repo in repos:
+        lic = repo.get('license') or {}
+        lic_text = lic.get('spdx_id') or ''
+        if not lic_text or lic_text == 'NOASSERTION':
+            lic_text = lic.get('name') or '-'
+        rows.append([repo['name'], lic_text,
+                     str(repo['stargazers_count']), str(repo['forks_count'])])
+
+    print_table(["REPO", "LICENSE", "STARS", "FORKS"], rows, right_align={2, 3})
 
 def read_owners_file():
     """Reads a list of usernames from owners.txt in the script's directory."""
@@ -162,19 +228,34 @@ def get_github_user_email(username):
 
 def _update_local_repo(repo_path, repo_name, clean_repos, wip_repos):
     """
-    Performs a fetch, status check, and conditional pull for a single repository.
+    Fetches to refresh remote-tracking refs, then fast-forwards the current
+    branch only when it is behind upstream and the working tree is clean.
     Appends the repo name to the appropriate list.
     """
     try:
+        # A fetch is unavoidable: without it we can't know whether the remote
+        # has new commits. It's a no-op on the wire when nothing changed.
         run_git(['fetch'], repo_path, check=True)
-        status_output = run_git(['status'], repo_path)
-        print(status_output)
-        if "nothing to commit, working tree clean" in status_output:
-            run_git(['pull'], repo_path, check=True)
-            clean_repos.append(repo_name)
-        else:
-            print("\nWARNING: Working tree not clean or has pending changes. Skipping 'git pull'")
+        status = get_repo_status(repo_path)
+
+        if status['to_commit'] or status['to_add']:
+            print(f"WARNING: Working tree not clean ({status['to_commit']} to commit, "
+                  f"{status['to_add']} to add). Skipping pull")
             wip_repos.append(repo_name)
+        elif status['behind'] is None:
+            print(f"No upstream set for branch '{status['branch']}'. Nothing to pull")
+            clean_repos.append(repo_name)
+        elif status['behind'] == 0:
+            print("Already up to date")
+            clean_repos.append(repo_name)
+        elif status['ahead']:
+            print(f"WARNING: Branch '{status['branch']}' has diverged from upstream "
+                  f"({status['behind']} behind, {status['ahead']} ahead). Skipping merge")
+            wip_repos.append(repo_name)
+        else:
+            print(f"Fast-forwarding {status['behind']} commit(s)..")
+            run_git(['merge', '--ff-only', '@{upstream}'], repo_path, check=True)
+            clean_repos.append(repo_name)
     except subprocess.CalledProcessError as e:
         print(f"Error updating '{repo_name}': {e}")
         return False
@@ -209,37 +290,59 @@ def clone_or_pull_repos(username, repos):
             except subprocess.CalledProcessError as e:
                 print(f"Error cloning '{repo_name}': {e}")
 
-def _prompt_for_identity(repo_name, known_identities):
+def _prompt_for_identity(repo_name, known_identities, repo_owner=None):
     """
     Prompts the user to select an existing identity or enter a new one.
 
     Args:
         repo_name (str): The name of the repository.
         known_identities (list): A list of (username, email) tuples.
+        repo_owner (str): The repo owner from the remote URL, offered as option 'O'.
 
     Returns:
         tuple: A (username, email) tuple for the repository.
     """
     print(f"\nNo complete user identity (name and email) set for '{repo_name}'.")
 
-    if not known_identities:
+    # If a known identity matches the owner, option 'O' can supply its email too
+    owner_identity = None
+    if repo_owner:
+        owner_identity = next((ident for ident in known_identities if repo_owner in ident[0]), None)
+
+    # The owner option subsumes its matching identity, so drop the duplicate
+    menu_identities = [ident for ident in known_identities if ident != owner_identity]
+
+    if not known_identities and not repo_owner:
         print("No existing identities found. Please enter a new one.")
         new_name = input("Enter user.name: ")
         new_email = input("Enter user.email: ")
         return new_name, new_email
 
     print("Please choose an identity:")
-    for i, (name, email) in enumerate(known_identities):
-        default_text = " (default, press Enter)" if i == 0 else ""
-        print(f"  {i+1}: {name} <{email}>{default_text}")
+    if repo_owner:
+        if owner_identity:
+            print(f"  O: {owner_identity[0]} <{owner_identity[1]}> (repo owner)")
+        else:
+            print(f"  O: {repo_owner} (repo owner, will prompt for email)")
+    for i, (name, email) in enumerate(menu_identities):
+        print(f"  {i+1}: {name} <{email}>")
 
     print("  N: Enter a new identity")
 
-    while True:
-        choice = input("Your choice: ").strip().lower()
+    default_name = repo_owner if repo_owner else menu_identities[0][0]
+    prompt = f"Your choice [{default_name}]: "
 
-        if not choice:  # Default to the most recent one
-            return known_identities[0]
+    while True:
+        choice = input(prompt).strip().lower()
+
+        if repo_owner and choice in ('', 'o', '0'):  # Owner is the default
+            if owner_identity:
+                return owner_identity
+            new_email = input(f"Enter user.email for '{repo_owner}': ")
+            return repo_owner, new_email
+
+        if not choice and menu_identities:  # Default to the most recent one
+            return menu_identities[0]
 
         if choice == 'n':
             new_name = input("Enter new user.name: ")
@@ -248,12 +351,13 @@ def _prompt_for_identity(repo_name, known_identities):
 
         try:
             choice_idx = int(choice) - 1
-            if 0 <= choice_idx < len(known_identities):
-                return known_identities[choice_idx]
+            if 0 <= choice_idx < len(menu_identities):
+                return menu_identities[choice_idx]
             else:
-                print(f"Invalid number. Please enter a number between 1 and {len(known_identities)}.")
+                print(f"Invalid number. Please enter a number between 1 and {len(menu_identities)}.")
         except ValueError:
-            print("Invalid input. Please enter a number or 'n'.")
+            valid = "a number, 'o', or 'n'" if repo_owner else "a number or 'n'"
+            print(f"Invalid input. Please enter {valid}.")
 
 def show_status():
     """
@@ -272,40 +376,26 @@ def show_status():
             local_email = run_git(['config', '--local', 'user.email'], repo_path)
             user = f"{local_username or '(not set)'}, {local_email or '(not set)'}"
 
-            branch = run_git(['branch', '--show-current'], repo_path) or '(detached)'
-
-            # "behind ahead" counts vs upstream; empty if no upstream is set
-            counts = run_git(['rev-list', '--left-right', '--count', '@{upstream}...HEAD'], repo_path)
-            if counts:
-                behind, ahead = (int(n) for n in counts.split())
-                to_pull = count_text(behind, "commits")
-                to_push = count_text(ahead, "commits")
+            status = get_repo_status(repo_path)
+            if status['behind'] is not None:
+                to_pull = count_text(status['behind'], "commits")
+                to_push = count_text(status['ahead'], "commits")
             else:
                 to_pull = to_push = "no upstream"
 
-            to_commit = 0
-            to_add = 0
-            for line in run_git(['status', '--porcelain'], repo_path).splitlines():
-                if line.startswith('??'):
-                    to_add += 1
-                else:
-                    to_commit += 1
-
-            rows.append([dir_name, user, branch, to_pull, to_push,
-                         count_text(to_commit, "files"), count_text(to_add, "files")])
+            rows.append([dir_name, user, status['branch'], to_pull, to_push,
+                         count_text(status['to_commit'], "files"), count_text(status['to_add'], "files")])
 
     if not rows:
         print("No git repos found in the current directory")
         return
 
-    headers = ["REPO", "USER", "BRANCH", "TO PULL", "TO PUSH", "TO COMMIT", "TO ADD"]
-    widths = [max(len(headers[i]), max(len(row[i]) for row in rows)) for i in range(len(headers))]
-    for row in [headers] + rows:
-        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+    print_table(["REPO", "USER", "BRANCH", "TO PULL", "TO PUSH", "TO COMMIT", "TO ADD"], rows)
 
-def update_repos():
+def update_repos(single_repo=None):
     """
     Updates all local repos in the current directory with the logic from git-update.sh.
+    If single_repo is given, only that repo is updated.
     """
     clean_repos = []
     wip_repos = []
@@ -318,6 +408,15 @@ def update_repos():
 
     current_dir = os.getcwd()
 
+    if single_repo:
+        repo_path = os.path.join(current_dir, single_repo)
+        if not os.path.isdir(repo_path) or '.git' not in os.listdir(repo_path):
+            print(f"Error: '{single_repo}' is not a git repo in the current directory")
+            sys.exit(1)
+        dir_names = [single_repo]
+    else:
+        dir_names = sorted(os.listdir('.'))
+
     # Create global gitignore if it doesn't exist
     gitignore_path = os.path.expanduser("~/.gitignore_global")
     if not os.path.exists(gitignore_path):
@@ -328,12 +427,15 @@ def update_repos():
     else:
         print("Global .gitignore file already exists. Skipping creation")
 
-    for dir_name in os.listdir('.'):
+    for dir_name in dir_names:
         repo_path = os.path.join(current_dir, dir_name)
         if os.path.isdir(repo_path) and dir_name != '.' and '.git' in os.listdir(repo_path):
             print("\n" + "="*64)
             print(f"    CHECKING REPO: {dir_name}")
             print("="*64 + "\n")
+
+            remote_url = run_git(['config', '--get', 'remote.origin.url'], repo_path)
+            repo_owner = get_repo_owner(remote_url)
 
             # Step 1: Check and set local user.name and email
             print("Step 1: check local user.name and email..")
@@ -341,8 +443,6 @@ def update_repos():
             local_email = run_git(['config', '--local', 'user.email'], repo_path)
 
             if not local_username or not local_email:
-                remote_url = run_git(['config', '--get', 'remote.origin.url'], repo_path)
-                repo_owner = get_repo_owner(remote_url)
                 new_username, new_email = (None, None)
 
                 if repo_owner and repo_owner in owners:
@@ -360,7 +460,7 @@ def update_repos():
                         print(f"Could not find a public email for '{repo_owner}'. Please set identity manually.")
 
                 if not local_username or not local_email:
-                    new_username, new_email = _prompt_for_identity(dir_name, known_identities)
+                    new_username, new_email = _prompt_for_identity(dir_name, known_identities, repo_owner)
                     if new_username and new_email:
                         run_git(['config', '--local', 'user.name', new_username], repo_path)
                         run_git(['config', '--local', 'user.email', new_email], repo_path)
@@ -378,9 +478,6 @@ def update_repos():
 
             # Step 2: Compare local user to repo owner
             print("\nStep 2: compare local user to repo owner..")
-            remote_url = run_git(['config', '--get', 'remote.origin.url'], repo_path)
-            repo_owner = get_repo_owner(remote_url)
-
             if not remote_url:
                 print("WARNING: No 'origin' remote found. Skipping owner check")
             elif not repo_owner:
@@ -392,7 +489,7 @@ def update_repos():
                     print(f"WARNING: Local user.name ('{local_username}') does NOT match repo owner ('{repo_owner}')")
                     owner_mismatch_repos.append(dir_name)
 
-            print(f"\nStep 3: fetch and pull (if clean) in {dir_name}..")
+            print(f"\nStep 3: fetch and fast-forward (if behind and clean) in {dir_name}..")
             _update_local_repo(repo_path, dir_name, clean_repos, wip_repos)
 
     print("\n" + "="*64)
@@ -427,8 +524,9 @@ if __name__ == "__main__":
     parser.add_argument("username", nargs='?', default=None, help="GitHub username to target (required for --list and --clone-all)")
     parser.add_argument("-l", "--list", action="store_true", help="List all public repos for username")
     parser.add_argument("-ca", "--clone-all", action="store_true", help="Clone/update all public repos for username")
-    parser.add_argument("-u", "--update", action="store_true", help="Update (fetch & pull) all local repos in the current directory")
-    parser.add_argument("-s", "--status", action="store_true", help="Show git status and user.name/user.email for all local repos in the current directory")
+    parser.add_argument("-u", "--update", nargs='?', const=True, default=False, metavar="REPO",
+                        help="Update (fetch & fast-forward) all local repos in the current directory, or just REPO if given")
+    parser.add_argument("-s", "--status", action="store_true", help="Show compact git status and user.name/user.email for all local repos in the current directory (default)")
 
     args = parser.parse_args()
 
@@ -438,18 +536,16 @@ if __name__ == "__main__":
         repos = list_github_repos(args.username)
         if repos is not None:
             if args.list:
-                if repos:
-                    for repo in repos:
-                        print(f"{repo}")
+                show_repo_list(repos)
 
             if args.clone_all:
-                clone_or_pull_repos(args.username, repos)
+                clone_or_pull_repos(args.username, [repo['name'] for repo in repos])
 
-    elif args.status:
+    elif args.status or len(sys.argv) == 1:
         show_status()
 
-    elif args.update or len(sys.argv) == 1:
-        update_repos()
+    elif args.update:
+        update_repos(args.update if isinstance(args.update, str) else None)
 
     else:
         parser.print_help()
