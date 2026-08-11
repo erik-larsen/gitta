@@ -290,7 +290,21 @@ def clone_or_pull_repos(username, repos):
             except subprocess.CalledProcessError as e:
                 print(f"Error cloning '{repo_name}': {e}")
 
-def _prompt_for_identity(repo_name, known_identities, repo_owner=None):
+def find_owner_identity(repo_path, repo_owner):
+    """
+    Searches the commit history for the most recent commit authored by the
+    repo owner and returns its (name, email), or None if no match is found.
+    """
+    if not repo_owner:
+        return None
+    log_output = run_git(['log', '--format=%an%x09%ae'], repo_path)
+    for line in log_output.splitlines():
+        name, _, email = line.partition('\t')
+        if repo_owner in name and email:
+            return name, email
+    return None
+
+def _prompt_for_identity(repo_name, known_identities, repo_owner=None, owner_identity=None):
     """
     Prompts the user to select an existing identity or enter a new one.
 
@@ -298,15 +312,15 @@ def _prompt_for_identity(repo_name, known_identities, repo_owner=None):
         repo_name (str): The name of the repository.
         known_identities (list): A list of (username, email) tuples.
         repo_owner (str): The repo owner from the remote URL, offered as option 'O'.
+        owner_identity (tuple): The owner's (name, email) found in commit history, if any.
 
     Returns:
         tuple: A (username, email) tuple for the repository.
     """
     print(f"\nNo complete user identity (name and email) set for '{repo_name}'.")
 
-    # If a known identity matches the owner, option 'O' can supply its email too
-    owner_identity = None
-    if repo_owner:
+    # Owner email comes from commit history when found, else from a matching known identity
+    if repo_owner and not owner_identity:
         owner_identity = next((ident for ident in known_identities if repo_owner in ident[0]), None)
 
     # The owner option subsumes its matching identity, so drop the duplicate
@@ -460,7 +474,8 @@ def update_repos(single_repo=None):
                         print(f"Could not find a public email for '{repo_owner}'. Please set identity manually.")
 
                 if not local_username or not local_email:
-                    new_username, new_email = _prompt_for_identity(dir_name, known_identities, repo_owner)
+                    owner_identity = find_owner_identity(repo_path, repo_owner)
+                    new_username, new_email = _prompt_for_identity(dir_name, known_identities, repo_owner, owner_identity)
                     if new_username and new_email:
                         run_git(['config', '--local', 'user.name', new_username], repo_path)
                         run_git(['config', '--local', 'user.email', new_email], repo_path)
