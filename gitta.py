@@ -505,7 +505,25 @@ def update_repos(single_repo=None):
                     print(f"WARNING: Local user.name ('{local_username}') does NOT match repo owner ('{repo_owner}')")
                     owner_mismatch_repos.append(dir_name)
 
-            print(f"\nStep 3: fetch and fast-forward (if behind and clean) in {dir_name}..")
+            # Step 3: Set credential.username so HTTPS pushes authenticate as the
+            # repo owner (needs a credential helper with per-account tokens,
+            # e.g. `gh auth login` for each account + `gh auth setup-git`).
+            print("\nStep 3: check credential.username for HTTPS pushes..")
+            if not remote_url or not remote_url.startswith('https://'):
+                print("No HTTPS 'origin' remote. Skipping credential.username")
+            elif not repo_owner:
+                print("Repo owner unknown. Skipping credential.username")
+            else:
+                cred_username = run_git(['config', '--local', 'credential.username'], repo_path)
+                if cred_username:
+                    print(f"credential.username already set to '{cred_username}'")
+                elif local_username and repo_owner in local_username:
+                    run_git(['config', '--local', 'credential.username', repo_owner], repo_path)
+                    print(f"Set credential.username to '{repo_owner}' so pushes authenticate as the repo owner")
+                else:
+                    print("Local user does not match repo owner. Skipping credential.username")
+
+            print(f"\nStep 4: fetch and fast-forward (if behind and clean) in {dir_name}..")
             _update_local_repo(repo_path, dir_name, clean_repos, wip_repos)
 
     print("\n" + "="*64)

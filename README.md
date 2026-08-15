@@ -24,7 +24,8 @@ Get up to date with the remote on all your local repos (or just one, if named). 
 
 1. Checks that a local user.name and user.email are set, and prompts if not — offering the repo owner (from the remote URL) as the default, plus a most-recently-used list of identities seen so far in the run.
 2. Warns if the local user.name doesn't match the repo owner.
-3. Fetches, then fast-forwards — but only if the repo is actually behind its upstream.  Repos with local changes or a diverged branch are left untouched and flagged.
+3. Sets credential.username to the repo owner (HTTPS remotes, owned repos only, never overwrites an existing value), so pushes authenticate as the right GitHub account.  This needs a credential helper that keeps per-account tokens — e.g. `gh auth login` for each account, then `gh auth setup-git`.
+4. Fetches, then fast-forwards — but only if the repo is actually behind its upstream.  Repos with local changes or a diverged branch are left untouched and flagged.
 
 Ends with a summary of which repos are clean, which have work in progress, and which are owned by someone else.
 
