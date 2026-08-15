@@ -404,6 +404,7 @@ def show_status():
         print("No git repos found in the current directory")
         return
 
+    rows.sort(key=lambda row: (row[1].lower(), row[0].lower()))
     print_table(["REPO", "USER", "BRANCH", "TO PULL", "TO PUSH", "TO COMMIT", "TO ADD"], rows)
 
 def update_repos(single_repo=None):
