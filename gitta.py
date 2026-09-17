@@ -275,6 +275,13 @@ def clone_or_pull_repos(username, repos):
     clean_repos = []
     wip_repos = []
 
+    # Reuse an identity already configured on a sibling repo owned by this
+    # user, so fresh clones get user.name/user.email without prompting.
+    owner_identity = match_owner_identity(username, harvest_identities())
+    if owner_identity:
+        print(f"Using identity from existing local repos for '{username}': "
+              f"{owner_identity[0]} <{owner_identity[1]}>")
+
     print(f"Processing repos for '{username}'..")
     for repo_name in repos:
         repo_path = os.path.join(os.getcwd(), repo_name)
@@ -289,6 +296,11 @@ def clone_or_pull_repos(username, repos):
                 run_git(['clone', repo_url], os.getcwd(), check=True)
             except subprocess.CalledProcessError as e:
                 print(f"Error cloning '{repo_name}': {e}")
+                continue
+            if owner_identity:
+                run_git(['config', '--local', 'user.name', owner_identity[0]], repo_path)
+                run_git(['config', '--local', 'user.email', owner_identity[1]], repo_path)
+                print(f"Set local user.name/user.email to {owner_identity[0]} <{owner_identity[1]}>")
 
 def find_owner_identity(repo_path, repo_owner):
     """
@@ -301,6 +313,37 @@ def find_owner_identity(repo_path, repo_owner):
     for line in log_output.splitlines():
         name, _, email = line.partition('\t')
         if repo_owner in name and email:
+            return name, email
+    return None
+
+def harvest_identities(base_dir=None):
+    """
+    Scans every git repo in base_dir (default: current directory) and returns
+    the unique (user.name, user.email) pairs set in their local config, in
+    directory order. Repos with an incomplete identity are skipped.
+    """
+    base_dir = base_dir or os.getcwd()
+    identities = []
+    for dir_name in sorted(os.listdir(base_dir)):
+        repo_path = os.path.join(base_dir, dir_name)
+        if not os.path.isdir(repo_path) or '.git' not in os.listdir(repo_path):
+            continue
+        name = run_git(['config', '--local', 'user.name'], repo_path)
+        email = run_git(['config', '--local', 'user.email'], repo_path)
+        if name and email and (name, email) not in identities:
+            identities.append((name, email))
+    return identities
+
+def match_owner_identity(repo_owner, identities):
+    """
+    Returns the first (name, email) in identities whose name or email
+    contains repo_owner (case-insensitive), or None if there is no match.
+    """
+    if not repo_owner:
+        return None
+    owner = repo_owner.lower()
+    for name, email in identities:
+        if owner in name.lower() or owner in email.lower():
             return name, email
     return None
 
@@ -415,7 +458,14 @@ def update_repos(single_repo=None):
     clean_repos = []
     wip_repos = []
     owner_mismatch_repos = []
-    known_identities = []
+
+    # Seed the identity list from every local repo so an owner already
+    # configured elsewhere can be reused without prompting.
+    known_identities = harvest_identities()
+    if known_identities:
+        print("Harvested identities from local repos:")
+        for name, email in known_identities:
+            print(f"    {name} <{email}>")
 
     owners = read_owners_file()
     if owners:
@@ -460,7 +510,17 @@ def update_repos(single_repo=None):
             if not local_username or not local_email:
                 new_username, new_email = (None, None)
 
-                if repo_owner and repo_owner in owners:
+                harvested = match_owner_identity(repo_owner, known_identities)
+                if harvested:
+                    new_username, new_email = harvested
+                    print(f"Repo owner '{repo_owner}' matches harvested identity "
+                          f"{new_username} <{new_email}>. Setting it without prompting.")
+                    run_git(['config', '--local', 'user.name', new_username], repo_path)
+                    run_git(['config', '--local', 'user.email', new_email], repo_path)
+                    local_username = new_username
+                    local_email = new_email
+
+                if (not local_username or not local_email) and repo_owner and repo_owner in owners:
                     print(f"Repo owner '{repo_owner}' found in owners.txt. Attempting to set identity.")
                     github_email = get_github_user_email(repo_owner)
                     if github_email:
@@ -553,14 +613,22 @@ def update_repos(single_repo=None):
 
     print("\ndone!")
 
+class _HelpFormatter(argparse.HelpFormatter):
+    """Marks the --status option as the default when no options are given."""
+    def _format_action_invocation(self, action):
+        text = super()._format_action_invocation(action)
+        if action.dest == 'status':
+            text += ', (default no options)'
+        return text
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Github repo management tool")
+    parser = argparse.ArgumentParser(description="Github repo management tool", formatter_class=_HelpFormatter)
+    parser.add_argument("-s", "--status", action="store_true", help="Show compact git status and user.name/user.email for all local repos in the current directory")
     parser.add_argument("username", nargs='?', default=None, help="GitHub username to target (required for --list and --clone-all)")
     parser.add_argument("-l", "--list", action="store_true", help="List all public repos for username")
     parser.add_argument("-ca", "--clone-all", action="store_true", help="Clone/update all public repos for username")
     parser.add_argument("-u", "--update", nargs='?', const=True, default=False, metavar="REPO",
                         help="Update (fetch & fast-forward) all local repos in the current directory, or just REPO if given")
-    parser.add_argument("-s", "--status", action="store_true", help="Show compact git status and user.name/user.email for all local repos in the current directory (default)")
 
     args = parser.parse_args()
 
