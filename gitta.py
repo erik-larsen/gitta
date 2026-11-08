@@ -226,11 +226,11 @@ def get_github_user_email(username):
         print(f"Warning: Network error fetching user data for '{username}': {e}")
         return None
 
-def _update_local_repo(repo_path, repo_name, clean_repos, wip_repos):
+def _update_local_repo(repo_path):
     """
     Fetches to refresh remote-tracking refs, then fast-forwards the current
     branch only when it is behind upstream and the working tree is clean.
-    Appends the repo name to the appropriate list.
+    Returns a (status, message) tuple where status is 'CLEAN', 'WIP', or 'ERROR'.
     """
     try:
         # A fetch is unavoidable: without it we can't know whether the remote
@@ -239,27 +239,17 @@ def _update_local_repo(repo_path, repo_name, clean_repos, wip_repos):
         status = get_repo_status(repo_path)
 
         if status['to_commit'] or status['to_add']:
-            print(f"WARNING: Working tree not clean ({status['to_commit']} to commit, "
-                  f"{status['to_add']} to add). Skipping pull")
-            wip_repos.append(repo_name)
-        elif status['behind'] is None:
-            print(f"No upstream set for branch '{status['branch']}'. Nothing to pull")
-            clean_repos.append(repo_name)
-        elif status['behind'] == 0:
-            print("Already up to date")
-            clean_repos.append(repo_name)
-        elif status['ahead']:
-            print(f"WARNING: Branch '{status['branch']}' has diverged from upstream "
-                  f"({status['behind']} behind, {status['ahead']} ahead). Skipping merge")
-            wip_repos.append(repo_name)
-        else:
-            print(f"Fast-forwarding {status['behind']} commit(s)..")
-            run_git(['merge', '--ff-only', '@{upstream}'], repo_path, check=True)
-            clean_repos.append(repo_name)
+            return 'WIP', f"{status['to_commit']} to commit, {status['to_add']} to add"
+        if status['behind'] is None:
+            return 'CLEAN', f"no upstream for '{status['branch']}'"
+        if status['behind'] == 0:
+            return 'CLEAN', "up to date"
+        if status['ahead']:
+            return 'WIP', f"diverged ({status['behind']} behind, {status['ahead']} ahead)"
+        run_git(['merge', '--ff-only', '@{upstream}'], repo_path, check=True)
+        return 'CLEAN', f"fast-forwarded {status['behind']} commit(s)"
     except subprocess.CalledProcessError as e:
-        print(f"Error updating '{repo_name}': {e}")
-        return False
-    return True
+        return 'ERROR', f"{' '.join(e.cmd)} failed (exit {e.returncode})"
 
 def clone_or_pull_repos(username, repos):
     """
@@ -271,9 +261,6 @@ def clone_or_pull_repos(username, repos):
     """
     if not repos:
         return
-
-    clean_repos = []
-    wip_repos = []
 
     # Reuse an identity already configured on a sibling repo owned by this
     # user, so fresh clones get user.name/user.email without prompting.
@@ -288,8 +275,8 @@ def clone_or_pull_repos(username, repos):
         repo_url = f"https://github.com/{username}/{repo_name}.git"
 
         if os.path.isdir(repo_path):
-            print(f"Updating '{repo_name}'..")
-            _update_local_repo(repo_path, repo_name, clean_repos, wip_repos)
+            status, msg = _update_local_repo(repo_path)
+            print(f"{repo_name}: {status}: {msg}")
         else:
             print(f"Cloning '{repo_name}'..")
             try:
@@ -455,10 +442,6 @@ def update_repos(single_repo=None):
     Updates all local repos in the current directory with the logic from git-update.sh.
     If single_repo is given, only that repo is updated.
     """
-    clean_repos = []
-    wip_repos = []
-    owner_mismatch_repos = []
-
     # Seed the identity list from every local repo so an owner already
     # configured elsewhere can be reused without prompting.
     known_identities = harvest_identities()
@@ -492,126 +475,111 @@ def update_repos(single_repo=None):
     else:
         print("Global .gitignore file already exists. Skipping creation")
 
+    # Pre-scan repos and their identities so the table columns can be sized
+    # before the rows stream out one at a time.
+    def user_text(name, email):
+        return f"{name or '(no name)'} <{email or '(no email)'}>"
+
+    repos = []
+    local_ids = {}
     for dir_name in dir_names:
         repo_path = os.path.join(current_dir, dir_name)
         if os.path.isdir(repo_path) and dir_name != '.' and '.git' in os.listdir(repo_path):
-            print("\n" + "="*64)
-            print(f"    CHECKING REPO: {dir_name}")
-            print("="*64 + "\n")
+            repos.append(dir_name)
+            local_ids[dir_name] = (run_git(['config', '--local', 'user.name'], repo_path),
+                                   run_git(['config', '--local', 'user.email'], repo_path))
 
-            remote_url = run_git(['config', '--get', 'remote.origin.url'], repo_path)
-            repo_owner = get_repo_owner(remote_url)
+    user_widths = [len(user_text(n, e)) for n, e in known_identities]
+    user_widths += [len(user_text(n, e)) for n, e in local_ids.values()]
+    w_repo = max([len("REPO")] + [len(r) for r in repos])
+    w_user = max([len("USER")] + user_widths)
+    w_status = len("NON-OWNED")
 
-            # Step 1: Check and set local user.name and email
-            print("Step 1: check local user.name and email..")
-            local_username = run_git(['config', '--local', 'user.name'], repo_path)
-            local_email = run_git(['config', '--local', 'user.email'], repo_path)
+    print("\nChecking repos..")
+    print(f"{'REPO'.ljust(w_repo)}  {'USER'.ljust(w_user)}  {'STATUS'.ljust(w_status)}  RESULT")
+    for dir_name in repos:
+        repo_path = os.path.join(current_dir, dir_name)
+        # Notes collected per check; printed as one table row per repo at the
+        # end, unless a check needs input (which prints its own details).
+        notes = []
+
+        remote_url = run_git(['config', '--get', 'remote.origin.url'], repo_path)
+        repo_owner = get_repo_owner(remote_url)
+
+        # Check 1: ensure local user.name and email are set
+        local_username, local_email = local_ids[dir_name]
+
+        if not local_username or not local_email:
+            new_username, new_email = (None, None)
+
+            harvested = match_owner_identity(repo_owner, known_identities)
+            if harvested:
+                new_username, new_email = harvested
+                notes.append("set identity from harvested")
+                run_git(['config', '--local', 'user.name', new_username], repo_path)
+                run_git(['config', '--local', 'user.email', new_email], repo_path)
+                local_username = new_username
+                local_email = new_email
+
+            if (not local_username or not local_email) and repo_owner and repo_owner in owners:
+                print(f"{dir_name}: repo owner '{repo_owner}' found in owners.txt. Attempting to set identity.")
+                github_email = get_github_user_email(repo_owner)
+                if github_email:
+                    notes.append(f"set identity from public email for '{repo_owner}'")
+                    new_username = repo_owner
+                    new_email = github_email
+                    run_git(['config', '--local', 'user.name', new_username], repo_path)
+                    run_git(['config', '--local', 'user.email', new_email], repo_path)
+                    local_username = new_username
+                    local_email = new_email
+                else:
+                    print(f"Could not find a public email for '{repo_owner}'. Please set identity manually.")
 
             if not local_username or not local_email:
-                new_username, new_email = (None, None)
-
-                harvested = match_owner_identity(repo_owner, known_identities)
-                if harvested:
-                    new_username, new_email = harvested
-                    print(f"Repo owner '{repo_owner}' matches harvested identity "
-                          f"{new_username} <{new_email}>. Setting it without prompting.")
+                owner_identity = find_owner_identity(repo_path, repo_owner)
+                new_username, new_email = _prompt_for_identity(dir_name, known_identities, repo_owner, owner_identity)
+                if new_username and new_email:
+                    notes.append("set identity from prompt")
                     run_git(['config', '--local', 'user.name', new_username], repo_path)
                     run_git(['config', '--local', 'user.email', new_email], repo_path)
                     local_username = new_username
                     local_email = new_email
 
-                if (not local_username or not local_email) and repo_owner and repo_owner in owners:
-                    print(f"Repo owner '{repo_owner}' found in owners.txt. Attempting to set identity.")
-                    github_email = get_github_user_email(repo_owner)
-                    if github_email:
-                        print(f"Found public email for '{repo_owner}': {github_email}")
-                        new_username = repo_owner
-                        new_email = github_email
-                        run_git(['config', '--local', 'user.name', new_username], repo_path)
-                        run_git(['config', '--local', 'user.email', new_email], repo_path)
-                        local_username = new_username
-                        local_email = new_email
-                    else:
-                        print(f"Could not find a public email for '{repo_owner}'. Please set identity manually.")
+        if local_username and local_email:
+            identity = (local_username, local_email)
+            if identity in known_identities:
+                known_identities.remove(identity)
+            known_identities.insert(0, identity)
 
-                if not local_username or not local_email:
-                    owner_identity = find_owner_identity(repo_path, repo_owner)
-                    new_username, new_email = _prompt_for_identity(dir_name, known_identities, repo_owner, owner_identity)
-                    if new_username and new_email:
-                        run_git(['config', '--local', 'user.name', new_username], repo_path)
-                        run_git(['config', '--local', 'user.email', new_email], repo_path)
-                        local_username = new_username
-                        local_email = new_email
+        # Check 2: compare local user to repo owner
+        owned = True
+        if not remote_url:
+            notes.append("no 'origin' remote, skipped owner check")
+        elif not repo_owner:
+            notes.append(f"no repo owner in remote URL: {remote_url}")
+        elif not (local_username and repo_owner in local_username):
+            owned = False
+            notes.append(f"owner '{repo_owner}'")
 
-            if local_username and local_email:
-                identity = (local_username, local_email)
-                if identity in known_identities:
-                    known_identities.remove(identity)
-                known_identities.insert(0, identity)
+        # Check 3: set credential.username so HTTPS pushes authenticate as
+        # the repo owner (needs a credential helper with per-account
+        # tokens, e.g. `gh auth login` for each account + `gh auth setup-git`).
+        # Quiet unless it changes something.
+        if remote_url and remote_url.startswith('https://') and repo_owner:
+            cred_username = run_git(['config', '--local', 'credential.username'], repo_path)
+            if not cred_username and local_username and repo_owner in local_username:
+                run_git(['config', '--local', 'credential.username', repo_owner], repo_path)
+                notes.append(f"set credential.username '{repo_owner}'")
 
-            print(f"Local user.name:  {local_username}")
-            print(f"Local user.email: {local_email}")
+        # Check 4: fetch and fast-forward (if behind and clean)
+        pull_status, msg = _update_local_repo(repo_path)
+        notes.append(msg)
+        # One status per repo: ERROR and WIP outrank NON-OWNED (the owner
+        # mismatch stays visible in RESULT), which outranks CLEAN.
+        status_text = 'NON-OWNED' if pull_status == 'CLEAN' and not owned else pull_status
 
-            # Step 2: Compare local user to repo owner
-            print("\nStep 2: compare local user to repo owner..")
-            if not remote_url:
-                print("WARNING: No 'origin' remote found. Skipping owner check")
-            elif not repo_owner:
-                print(f"ERROR: Could not determine repo owner from remote URL: {remote_url}")
-            else:
-                if repo_owner and local_username and repo_owner in local_username:
-                    print(f"OK: Local user.name ('{local_username}') matches repo owner ('{repo_owner}')")
-                else:
-                    print(f"WARNING: Local user.name ('{local_username}') does NOT match repo owner ('{repo_owner}')")
-                    owner_mismatch_repos.append(dir_name)
-
-            # Step 3: Set credential.username so HTTPS pushes authenticate as the
-            # repo owner (needs a credential helper with per-account tokens,
-            # e.g. `gh auth login` for each account + `gh auth setup-git`).
-            print("\nStep 3: check credential.username for HTTPS pushes..")
-            if not remote_url or not remote_url.startswith('https://'):
-                print("No HTTPS 'origin' remote. Skipping credential.username")
-            elif not repo_owner:
-                print("Repo owner unknown. Skipping credential.username")
-            else:
-                cred_username = run_git(['config', '--local', 'credential.username'], repo_path)
-                if cred_username:
-                    print(f"credential.username already set to '{cred_username}'")
-                elif local_username and repo_owner in local_username:
-                    run_git(['config', '--local', 'credential.username', repo_owner], repo_path)
-                    print(f"Set credential.username to '{repo_owner}' so pushes authenticate as the repo owner")
-                else:
-                    print("Local user does not match repo owner. Skipping credential.username")
-
-            print(f"\nStep 4: fetch and fast-forward (if behind and clean) in {dir_name}..")
-            _update_local_repo(repo_path, dir_name, clean_repos, wip_repos)
-
-    print("\n" + "="*64)
-    print("    REPOS SUMMARY ")
-    print("="*64 + "\n")
-
-    print("CLEAN repos (working tree clean and pulled):")
-    if not clean_repos:
-        print("  None")
-    else:
-        for repo in clean_repos:
-            print(f"    {repo}")
-
-    print("\nWIP repos (working tree not clean or has pending changes):")
-    if not wip_repos:
-        print("  None")
-    else:
-        for repo in wip_repos:
-            print(f"    {repo}")
-
-    print("\nNON-OWNED repos (user and owner differ):")
-    if not owner_mismatch_repos:
-        print("  None")
-    else:
-        for repo in owner_mismatch_repos:
-            print(f"    {repo}")
-
-    print("\ndone!")
+        print(f"{dir_name.ljust(w_repo)}  {user_text(local_username, local_email).ljust(w_user)}  "
+              f"{status_text.ljust(w_status)}  " + "; ".join(notes))
 
 class _HelpFormatter(argparse.HelpFormatter):
     """Marks the --status option as the default when no options are given."""
